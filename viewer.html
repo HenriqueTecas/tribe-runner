@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>TRIBE v2 Brain Viewer</title>
+  <script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/3.5.0/model-viewer.min.js"></script>
+  <style>
+    :root { color-scheme: light; --pos:#d62828; --neg:#1d4ed8; }
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 24px; background: #fafafa; color: #222; max-width: 1100px; }
+    h1 { margin: 0 0 4px; font-size: 20px; }
+    .hint { color: #666; font-size: 13px; margin: 0 0 16px; }
+    .row { display: flex; gap: 8px; margin: 8px 0; align-items: center; flex-wrap: wrap; }
+    input[type=text] { flex: 1 1 320px; padding: 10px 12px; font-size: 15px; border: 1px solid #bbb; border-radius: 6px; }
+    select { padding: 8px; border: 1px solid #bbb; border-radius: 6px; background: white; }
+    button { padding: 10px 16px; font-size: 15px; background: #2962ff; color: white; border: 0; border-radius: 6px; cursor: pointer; }
+    button:disabled { background: #aaa; cursor: not-allowed; }
+    #status { font-size: 13px; color: #555; min-height: 18px; }
+    #status.error { color: #c62828; font-weight: 600; }
+    #status.ok { color: #2e7d32; }
+    model-viewer { width: 100%; height: 60vh; min-height: 460px; background: white; border: 1px solid #ddd; border-radius: 8px; }
+    #meta { font-family: ui-monospace, monospace; font-size: 12px; color: #555; margin-top: 8px; }
+    label { font-size: 13px; color: #555; }
+
+    .panel { margin-top: 18px; border: 1px solid #e3e3e3; border-radius: 8px; background: white; padding: 14px 16px; }
+    .panel h3 { margin: 0 0 10px; font-size: 14px; color: #444; font-weight: 600; }
+    .regions { display: grid; grid-template-columns: 100px 1fr 56px; gap: 4px 12px; align-items: center; font-size: 13px; }
+    .regions .name { font-family: ui-monospace, monospace; font-weight: 600; color: #222; }
+    .regions .name .hemi { color: #888; font-weight: 400; margin-left: 4px; }
+    .regions .desc { color: #555; font-size: 12.5px; line-height: 1.35; cursor: help; }
+    .regions .val { font-family: ui-monospace, monospace; font-size: 12px; color: #444; text-align: right; }
+    .regions .bar-cell { grid-column: 1 / -1; height: 0; }       /* unused */
+    .regions .barwrap { position: relative; height: 6px; background: #eef; border-radius: 3px; grid-column: 2 / 3; }
+    .regions .barwrap::before { content: ""; position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: #aab; }
+    .regions .bar { position: absolute; top: 0; bottom: 0; border-radius: 3px; }
+    .regions .bar.pos { background: var(--pos); left: 50%; }
+    .regions .bar.neg { background: var(--neg); right: 50%; }
+    .empty { color: #888; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>TRIBE v2 Brain Viewer</h1>
+  <p class="hint">
+    Server: <code id="wsurl"></code>.
+    Drag to rotate, scroll to zoom. Tunnel must be live:
+    <code>ssh -L 8000:localhost:8000 ...</code>
+  </p>
+
+  <div class="row">
+    <input id="phrase" type="text" placeholder="enter a phrase..." value="the quick brown fox jumps over the lazy dog">
+    <label>reduce: <select id="reduction">
+      <option value="mean" selected>mean</option>
+      <option value="max">max</option>
+      <option value="first">first</option>
+      <option value="last">last</option>
+    </select></label>
+    <label>cmap: <select id="cmap">
+      <option value="bwr" selected>bwr</option>
+      <option value="seismic">seismic</option>
+      <option value="coolwarm">coolwarm</option>
+    </select></label>
+    <button id="go">Predict</button>
+  </div>
+
+  <div id="status">disconnected</div>
+  <div id="meta"></div>
+
+  <model-viewer id="mv"
+                camera-controls
+                auto-rotate
+                auto-rotate-delay="2500"
+                rotation-per-second="20deg"
+                environment-image="legacy"
+                exposure="1.0"
+                shadow-intensity="0.6"
+                shadow-softness="0.7"
+                tone-mapping="aces"
+                interaction-prompt="none"></model-viewer>
+
+  <div class="panel">
+    <h3>Top activated cortical regions <span style="color:#888;font-weight:400">(HCP-MMP)</span></h3>
+    <div id="regions" class="regions"><div class="empty">no prediction yet</div></div>
+  </div>
+
+  <script>
+    const WS_URL = `ws://${location.hostname || 'localhost'}:${location.port || 8000}/ws`;
+    document.getElementById('wsurl').textContent = WS_URL;
+    const $status = document.getElementById('status');
+    const $meta   = document.getElementById('meta');
+    const $mv     = document.getElementById('mv');
+    const $go     = document.getElementById('go');
+    const $phrase = document.getElementById('phrase');
+    const $regions = document.getElementById('regions');
+
+    function setStatus(text, cls = '') { $status.textContent = text; $status.className = cls; }
+
+    function renderRegions(rows) {
+      if (!rows || !rows.length) {
+        $regions.innerHTML = '<div class="empty">no regions returned</div>';
+        return;
+      }
+      const maxAbs = Math.max(...rows.map(r => Math.abs(r.mean))) || 1e-9;
+      const html = rows.map(r => {
+        const pct = Math.min(100, (Math.abs(r.mean) / maxAbs) * 100);
+        const bar = r.mean >= 0
+          ? `<div class="bar pos" style="width:${pct/2}%"></div>`
+          : `<div class="bar neg" style="width:${pct/2}%"></div>`;
+        const sign = r.mean >= 0 ? '+' : '';
+        return `
+          <div class="name">${r.name}<span class="hemi">·${r.hemi}</span></div>
+          <div class="barwrap" title="${r.description.replace(/"/g,'&quot;')}">${bar}</div>
+          <div class="val">${sign}${r.mean.toFixed(3)}</div>
+          <div></div>
+          <div class="desc" title="${r.description.replace(/"/g,'&quot;')}">${r.description}</div>
+          <div></div>
+        `;
+      }).join('');
+      $regions.innerHTML = html;
+    }
+
+    let ws = null;
+    let pendingMeta = null;
+    let lastBlobUrl = null;
+
+    function connect() {
+      ws = new WebSocket(WS_URL);
+      ws.binaryType = 'blob';
+      ws.onopen  = () => { setStatus('connected — waiting for input', 'ok'); $go.disabled = false; };
+      ws.onclose = () => { setStatus('disconnected — retrying in 2s', 'error'); $go.disabled = true; setTimeout(connect, 2000); };
+      ws.onerror = () => setStatus('connection error', 'error');
+      ws.onmessage = async (evt) => {
+        if (typeof evt.data === 'string') {
+          if (evt.data.startsWith('ERROR:')) { setStatus(evt.data, 'error'); $go.disabled = false; return; }
+          try { pendingMeta = JSON.parse(evt.data); }
+          catch { setStatus('unknown text frame: ' + evt.data, 'error'); }
+          return;
+        }
+        if (lastBlobUrl) URL.revokeObjectURL(lastBlobUrl);
+        lastBlobUrl = URL.createObjectURL(evt.data);
+        $mv.src = lastBlobUrl;
+        if (pendingMeta) {
+          $meta.textContent =
+            `phrase: ${JSON.stringify(pendingMeta.phrase)}  |  ` +
+            `segments: ${pendingMeta.n_segments}  |  ` +
+            `signal range: [${pendingMeta.signal_min.toFixed(3)}, ${pendingMeta.signal_max.toFixed(3)}]  |  ` +
+            `glb: ${(evt.data.size / 1024).toFixed(1)} KB`;
+          renderRegions(pendingMeta.top_regions);
+          pendingMeta = null;
+        }
+        setStatus('done', 'ok');
+        $go.disabled = false;
+      };
+    }
+    connect();
+
+    function submit() {
+      const phrase = $phrase.value.trim();
+      if (!phrase) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) { setStatus('not connected', 'error'); return; }
+      $go.disabled = true;
+      setStatus('predicting…');
+      ws.send(JSON.stringify({
+        phrase,
+        reduction: document.getElementById('reduction').value,
+        cmap: document.getElementById('cmap').value,
+      }));
+    }
+    $go.addEventListener('click', submit);
+    $phrase.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+  </script>
+</body>
+</html>
